@@ -1,0 +1,17 @@
+{
+  "name": "llm-wiki",
+  "owner": {
+    "name": "Rami Al Osman",
+    "url": "https://github.com/ramialosmann"
+  },
+  "plugins": [
+    {
+      "name": "llm-wiki",
+      "source": "./",
+      "description": "A Claude-maintained markdown wiki per project, kept in step with git."
+    }
+  ],
+  "metadata": {
+    "description": "Claude-maintained project wikis kept in step with git."
+  }
+}
