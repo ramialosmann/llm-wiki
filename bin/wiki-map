@@ -1,0 +1,249 @@
+#!/usr/bin/env node
+// wiki-map [repo-dir] [--if-stale] [--quiet] [--stdout] — write <wiki>/code/<repo>-map.md.
+//
+// A readable, greppable map of a JS/TS repo: HTTP routes (NestJS decorators, Next.js app/pages
+// routers), Expo Router screens, scheduled jobs and event handlers, and exports per file, each line
+// self-contained (full path) so one grep hit is enough. Zero LLM tokens, zero dependencies.
+// Stamped with the HEAD sha; --if-stale skips the rebuild when the stamp already matches HEAD.
+//
+// shortcut: regex, not a parser — misses routes inherited from base controllers, computed decorator
+// arguments, RouterModule prefixes and CommonJS exports; move to tree-sitter if the map must be exact.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { enabled, resolve, git, frontmatter, writeAtomic, codeMapPath } = require('../lib/wiki');
+
+const MAX_FILES = 5000;
+// Only grepped (wiki-find returns single lines), never injected; the cap bounds an accidental full Read (~12k tokens).
+const CAP = Number(process.env.WIKI_MAP_CHARS || 48000);
+const SRC = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
+const SKIP_DIR = /(^|\/)(node_modules|dist|build|out|coverage|vendor|\.next|\.expo|\.turbo|\.cache|tests?|__tests__|__mocks__|e2e|fixtures|android|ios)(\/|$)/;
+const SKIP_FILE = /(\.d\.ts|\.(test|spec|e2e-spec|stories|min|gen)\.[a-z]+|(^|\/)(jest|vitest|babel|metro|eslint|prettier|tailwind|postcss|next|webpack|vite)\.config\.[a-z]+)$/;
+const MIGRATION = /(^|\/)migrations?\//;
+const LOW_VALUE = /(^|\/)(template-core|components\/ui|ui|generated|vendor|third[-_]party)(\/|$)/;
+const APP_FILE = /(^|\/)app\/(.*\/)?(page|layout|route|loading|error|not-found|template|default|_layout)\.[jt]sx?$/;
+const VERBS = 'Get|Post|Put|Patch|Delete|All|Options|Head';
+const HTTP = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'constructor', 'super']);
+
+const lineAt = (text, idx) => text.slice(0, idx).split('\n').length;
+const str = (s) => (s || '').replace(/^['"`]|['"`]$/g, '');
+const join = (...parts) => '/' + parts.map((p) => (p || '').replace(/^\/+|\/+$/g, '')).filter(Boolean).join('/');
+
+function exportsOf(text) {
+  const names = [];
+  const add = (n) => { if (n && !n.startsWith('_') && !names.includes(n)) names.push(n); };
+  for (const m of text.matchAll(/^export\s+(?:declare\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\*?|class|const|let|var|interface|type|enum)\s+([A-Za-z_$][\w$]*)/gm)) add(m[1]);
+  for (const m of text.matchAll(/^export\s*(?:type\s*)?\{([^}]*)\}(?!\s*from)/gm)) {
+    for (const part of m[1].split(',')) add((part.trim().match(/(?:[\w$]+\s+as\s+)?([A-Za-z_$][\w$]*)$/) || [])[1]);
+  }
+  const def = /^export\s+default\s+([A-Za-z_$][\w$]*)\s*;?\s*$/m.exec(text);
+  if (def) add(def[1]);
+  return names;
+}
+
+// Method name on the first non-decorator line after a route/job decorator.
+function methodAfter(text, from) {
+  for (const line of text.slice(from).split('\n').slice(1, 40)) {
+    const t = line.trim();
+    if (!t || t.startsWith('@') || t.startsWith('//') || t.startsWith('*') || t.startsWith('/*')) continue;
+    const m = /^(?:(?:public|private|protected|static|override|readonly)\s+)*(?:async\s+)?([A-Za-z_$][\w$]*)\s*[(<]/.exec(t);
+    if (m && !KEYWORDS.has(m[1])) return m[1];
+  }
+  return '';
+}
+
+function nestRoutes(file, text, prefix) {
+  const out = [];
+  const ctrls = [...text.matchAll(/@Controller\(\s*([^)]*?)\s*\)/g)];
+  ctrls.forEach((c, i) => {
+    const arg = c[1];
+    const pathArg = /path:\s*(['"`][^'"`]*['"`])/.exec(arg);
+    const base = /^['"`]/.test(arg) ? str(arg) : pathArg ? str(pathArg[1]) : arg ? `{${arg}}` : '';
+    const end = i + 1 < ctrls.length ? ctrls[i + 1].index : text.length;
+    const body = text.slice(c.index, end);
+    for (const r of body.matchAll(new RegExp(`@(${VERBS})\\(\\s*([^)]*?)\\s*\\)`, 'g'))) {
+      const sub = /^['"`]/.test(r[2]) ? str(r[2]) : r[2] ? `{${r[2]}}` : '';
+      const at = c.index + r.index;
+      out.push(`${r[1].toUpperCase()} ${join(prefix, base, sub)} → ${file}:${lineAt(text, at)} ${methodAfter(text, at)}`.trimEnd());
+    }
+  });
+  return out;
+}
+
+function jobs(file, text) {
+  const out = [];
+  for (const m of text.matchAll(/@(Cron|Interval|Timeout|OnEvent|SubscribeMessage|MessagePattern|EventPattern|Process|OnQueueEvent)\(\s*([^)]*?)\s*\)/g)) {
+    out.push(`@${m[1]}(${m[2].slice(0, 60)}) → ${file}:${lineAt(text, m.index)} ${methodAfter(text, m.index)}`.trimEnd());
+  }
+  return out;
+}
+
+// app-router segment path -> URL: drop (groups) and @slots, keep [params].
+const appUrl = (segs) => join(...segs.filter((s) => !/^\(.*\)$/.test(s) && !s.startsWith('@')));
+
+function frameworkRoutes(file, text, pkg) {
+  const out = { routes: [], screens: [] };
+  const rel = pkg.dir ? path.relative(pkg.dir, file) : file;
+  const app = /^(?:src\/)?app\/(.*)$/.exec(rel);
+  const pages = /^(?:src\/)?pages\/(.*)$/.exec(rel);
+  if (pkg.next && app) {
+    const segs = app[1].split('/');
+    const leaf = segs.pop();
+    if (/^page\.[jt]sx?$/.test(leaf)) out.screens.push(`${appUrl(segs)} → ${file} (next page)`);
+    if (/^route\.[jt]sx?$/.test(leaf)) {
+      const verbs = HTTP.filter((v) => new RegExp(`export\\s+(?:async\\s+)?(?:function|const)\\s+${v}\\b`).test(text));
+      out.routes.push(`${verbs.join('|') || 'ANY'} ${appUrl(segs)} → ${file} (next route)`);
+    }
+  } else if (pkg.next && pages) {
+    const p = pages[1].replace(/\.[jt]sx?$/, '').replace(/(^|\/)index$/, '');
+    if (!/(^|\/)_(app|document|error)$/.test(p)) {
+      if (p.startsWith('api/')) out.routes.push(`ANY ${join(p)} → ${file} (next api)`);
+      else out.screens.push(`${join(p)} → ${file} (next page)`);
+    }
+  } else if (pkg.expoRouter && app) {
+    const segs = app[1].replace(/\.[jt]sx?$/, '').split('/');
+    const leaf = segs[segs.length - 1];
+    if (!leaf.startsWith('_') && !leaf.startsWith('+')) {
+      if (leaf === 'index') segs.pop();
+      out.screens.push(`${appUrl(segs)} → ${file} (expo screen)`);
+    }
+  }
+  return out;
+}
+
+function packageFor(repo, file, cache) {
+  let dir = path.dirname(file);
+  for (;;) {
+    if (cache.has(dir)) return cache.get(dir);
+    let pkg = null;
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(repo, dir, 'package.json'), 'utf8'));
+      const deps = { ...j.dependencies, ...j.devDependencies };
+      pkg = { dir: dir === '.' ? '' : dir, next: 'next' in deps, expoRouter: 'expo-router' in deps };
+    } catch { /* keep walking up */ }
+    if (pkg || dir === '.' || dir === '') {
+      pkg = pkg || { dir: '', next: false, expoRouter: false };
+      cache.set(dir, pkg);
+      return pkg;
+    }
+    dir = path.dirname(dir);
+  }
+}
+
+// Folders a file imports from: relative specs plus the `src/…` (baseUrl) and `@/…` aliases common in Nest/Next.
+function usesOf(repo, file, text, pkg) {
+  const dirs = new Set();
+  if (pkg.alias === undefined) pkg.alias = fs.existsSync(path.join(repo, pkg.dir, 'src')) ? path.join(pkg.dir, 'src') : pkg.dir;
+  for (const m of text.matchAll(/(?:from\s+|import\s*\(\s*|require\(\s*)['"]((?:\.{1,2}|src|@)\/[^'"]+)['"]/g)) {
+    const spec = m[1];
+    const target = spec.startsWith('.') ? path.join(path.dirname(file), spec)
+      : spec.startsWith('@/') ? path.join(pkg.alias, spec.slice(2)) : path.join(pkg.dir, spec);
+    dirs.add(path.dirname(path.normalize(target)).replace(/\\/g, '/'));
+  }
+  return [...dirs];
+}
+
+function buildMap(repo, name, sha) {
+  const files = git(repo, ['ls-files']).split('\n')
+    .filter((f) => SRC.test(f) && !SKIP_DIR.test(f) && !SKIP_FILE.test(f)).slice(0, MAX_FILES);
+  const prefixFile = files.find((f) => /(^|\/)main\.ts$/.test(f) && /setGlobalPrefix/.test(read(repo, f)));
+  const prefix = prefixFile ? str((/setGlobalPrefix\(\s*(['"`][^'"`]*['"`])/.exec(read(repo, prefixFile)) || [])[1]) : '';
+  const routes = [], screens = [], events = [], byDir = new Map(), uses = new Map(), pkgCache = new Map();
+  let migrations = 0;
+  for (const f of files) {
+    if (MIGRATION.test(f)) { migrations++; continue; }
+    const text = read(repo, f);
+    if (!text) continue;
+    if (text.includes('@Controller')) routes.push(...nestRoutes(f, text, prefix));
+    events.push(...jobs(f, text));
+    const fw = frameworkRoutes(f, text, packageFor(repo, f, pkgCache));
+    routes.push(...fw.routes);
+    screens.push(...fw.screens);
+    const dir = path.dirname(f);
+    const counts = uses.get(dir) || new Map();
+    uses.set(dir, counts);
+    for (const u of usesOf(repo, f, text, packageFor(repo, f, pkgCache))) if (u !== dir) counts.set(u, (counts.get(u) || 0) + 1);
+    if (/(^|\/)index\.[jt]sx?$/.test(f) && /^\s*(export\s+\*\s+from[^\n]*\n?\s*)+$/.test(text)) continue; // pure barrel
+    if (APP_FILE.test(f)) continue; // app-router files are already under Pages & screens / Routes
+    const names = exportsOf(text);
+    if (names.length) byDir.set(dir, [...(byDir.get(dir) || []), { f, names }]);
+  }
+  const short = (sha || '').slice(0, 8);
+  const head = [
+    '---', `title: "Code map — ${name}"`, 'type: code-map', 'generated: true', `repo: "${name}"`,
+    `built_at: "${sha}"`, `built: "${new Date().toISOString().slice(0, 10)}"`,
+    `summary: "Regex-built map of routes, screens, jobs and exports in ${name}"`, '---', '',
+    `# Code map — ${name}`, '',
+    `> [!info] Generated by wiki-map from ${name}@${short}. Do not edit; rebuilt on new commits.`,
+    '> Regex-based: misses routes inherited from base controllers, computed decorator args and CommonJS. The code is the truth.',
+    '',
+  ];
+  // Entries are list items: one line each in Obsidian, and the vault's unwrap hook never joins list items.
+  const section = (title, lines) => (lines.length ? [`## ${title}`, ...lines.map((l) => (l.startsWith('### ') ? l : `- ${l}`)), ''] : []);
+  const usesLine = (dir) => {
+    const top = [...(uses.get(dir) || new Map())].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([d]) => d);
+    return top.length ? ` — uses: ${top.join(', ')}` : '';
+  };
+  const dirs = [...byDir.keys()].sort();
+  const fileLine = ({ f, names }) => `${f}: ${names.slice(0, 12).join(', ')}${names.length > 12 ? ', …' : ''}`;
+  const firstNames = (items) => { const n = items.map((x) => x.names[0]); return n.slice(0, 30).join(', ') + (n.length > 30 ? ', …' : ''); };
+  const collapsed = new Set();
+  const render = () => [
+    ...head,
+    ...section(`Routes${prefix ? ` (global prefix /${prefix.replace(/^\//, '')})` : ''}`, routes),
+    ...section('Pages & screens', screens),
+    ...section('Jobs & events', events),
+    ...section('Files', dirs.flatMap((d) => collapsed.has(d)
+      ? [`${d}/ (${byDir.get(d).length} files, first export each): ${firstNames(byDir.get(d))}${usesLine(d)}`]
+      : [`### ${d}/${usesLine(d)}`, ...byDir.get(d).map(fileLine)])),
+    ...(migrations ? [`(${migrations} migration files not listed)`, ''] : []),
+  ].join('\n');
+  let out = render();
+  // Over the cap: collapse the biggest folders first (UI kits, vendored cores) until it fits.
+  const size = (d) => byDir.get(d).map(fileLine).join('').length;
+  // Vendored bases and UI kits go first: their names matter least when hunting for project logic.
+  // Then folders whose exports just repeat their filenames (component folders): the path already says it.
+  const norm = (x) => x.toLowerCase().replace(/[-_.]/g, '');
+  const echo = (d) => byDir.get(d).filter(({ f, names }) => names.length === 1 && norm(names[0]) === norm(path.basename(f).replace(/\.[^.]+$/, ''))).length / byDir.get(d).length;
+  const bySize = [...byDir.keys()].sort((a, b) => (LOW_VALUE.test(b) - LOW_VALUE.test(a))
+    || (echo(b) >= 0.6) - (echo(a) >= 0.6) || size(b) - size(a));
+  while (out.length > CAP && bySize.length) { collapsed.add(bySize.shift()); out = render(); }
+  if (out.length > CAP) out = out.slice(0, CAP).replace(/\n[^\n]*$/, '') + '\n(truncated at cap)\n';
+  return out;
+}
+
+function read(repo, f) {
+  try {
+    const abs = path.join(repo, f);
+    if (!fs.lstatSync(abs).isFile()) return '';
+    const fd = fs.openSync(abs, 'r');
+    const buf = Buffer.alloc(65536);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    return buf.toString('utf8', 0, n);
+  } catch { return ''; }
+}
+
+function builtAt(file) {
+  try { return frontmatter(fs.readFileSync(file, 'utf8')).data.built_at || ''; } catch { return ''; }
+}
+
+module.exports = { buildMap, exportsOf, nestRoutes, frameworkRoutes, builtAt };
+
+if (require.main === module) {
+  if (process.env.WIKI_OFF === '1') process.exit(0);
+  const args = process.argv.slice(2);
+  const flag = (f) => args.includes(f);
+  const dir = args.find((a) => !a.startsWith('--')) || process.cwd();
+  const r = resolve(dir);
+  if (!r || !r.repo) { if (!flag('--quiet')) console.error('wiki-map: no tracked repo here'); process.exit(2); }
+  const sha = git(r.repoPath, ['rev-parse', 'HEAD']).trim();
+  const file = codeMapPath(r);
+  if (flag('--hook') && !enabled(r)) process.exit(0); // the SessionStart rebuild honours WIKI_ONLY; manual runs don't
+  if (flag('--if-stale') && sha && builtAt(file) === sha) process.exit(0);
+  const map = buildMap(r.repoPath, r.repo, sha);
+  if (flag('--stdout')) process.stdout.write(map);
+  else writeAtomic(file, map);
+  if (!flag('--quiet') && !flag('--stdout')) console.log(`wiki-map: ${file} (${map.length} chars, ${r.repo}@${sha.slice(0, 8)})`);
+}

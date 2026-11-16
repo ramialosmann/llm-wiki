@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+// wiki-unsynced [--count] [--limit N] [repo-dir] — commits the wiki hasn't absorbed, oldest first.
+// Prints "<short> <date> <subject>" per commit (or the number with --count) and RANGE=<range> on stderr.
+// Exit: 0 nothing unsynced, 1 unsynced commits exist, 2 not a tracked repo.
+'use strict';
+const { resolve, unsynced } = require('../lib/wiki');
+const args = process.argv.slice(2);
+let count = false, limit = 200, dir;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--count') count = true;
+  else if (args[i] === '--limit') limit = Number(args[++i]) || 200;
+  else dir = args[i];
+}
+const u = unsynced(resolve(dir || process.cwd()), { limit, warn: (m) => process.stderr.write(m + '\n') });
+if (!u) process.exit(2);
+process.stderr.write(`RANGE=${u.range}\n`);
+if (count) process.stdout.write(u.commits.length + '\n');
+else if (u.commits.length) process.stdout.write(u.commits.join('\n') + '\n');
+process.exit(u.commits.length ? 1 : 0);

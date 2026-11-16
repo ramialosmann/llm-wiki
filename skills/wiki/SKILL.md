@@ -1,89 +1,74 @@
 ---
 name: wiki
-description: "Maintain a project's LLM wiki (Karpathy pattern: raw sources → Claude-maintained markdown wiki → schema), kept in step with git. Ops: sync (fold unsynced commits into the wiki), ingest (add a paper/datasheet/doc/url), query (answer from the wiki, optionally file the answer), save (checkpoint where the repo stands), lint (health check), init (new wiki). TRIGGER on `/wiki`, 'sync the wiki', 'update the wiki', 'add this to the wiki', 'what does the wiki say about', 'lint the wiki', and when the SessionStart hook reports unsynced commits and the user agrees to sync."
+description: "Project LLM wiki (Karpathy pattern), kept in step with git. Ops: sync (fold unsynced commits in), ingest (add a doc/url), query (answer from the wiki), save (checkpoint the session), lint, init. Use on /wiki, 'sync the wiki', 'update the wiki', 'add this to the wiki', 'what does the wiki say about', 'lint the wiki', or when the session brief reports unsynced commits and the user agrees to sync."
 argument-hint: "sync | ingest <file|url> | query <question> | save | lint | init <wiki-dir>"
-allowed-tools:
-  - Read
-  - Write
-  - Edit
-  - Bash
-  - Glob
-  - Grep
-  - WebFetch
-  - AskUserQuestion
+allowed-tools: [Read, Write, Edit, Bash, Glob, Grep, WebFetch, Agent, AskUserQuestion]
 ---
 
 # wiki
 
-`<skill-dir>` below is this skill's base directory (shown when the skill loads).
+Page rules live in `conventions.md` next to this file. Read it before writing pages, then the wiki's own
+`CLAUDE.md` (its schema, which wins). If a schema points at `~/.claude/skills/_wiki-shared/conventions.md`, that
+is the old v1 copy: use this skill's `conventions.md` instead.
 
-Before any operation, read `<skill-dir>/conventions.md` (the rules for layers, files, pages and
-operations) and then the wiki's own `CLAUDE.md` (its schema, which takes precedence).
-
-Find the wiki from the current directory:
+The plugin's commands are on PATH: `wiki-resolve`, `wiki-unsynced`, `wiki-find`, `wiki-map`, `wiki-sync-prep`,
+`wiki-finish`, `wiki-index`, `wiki-lint`. They do every mechanical step, so you never read `log.md`, never
+read `git log -p` over a range, and never hand-edit `synced:`, `updated:`, `verified:` or the index list.
 
 ```bash
-eval "$(<skill-dir>/bin/wiki-resolve.sh)"   # WIKI_ROOT WIKI_REPO WIKI_REPO_PATH WIKI_STATE WIKI_REPOS
+eval "$(wiki-resolve)"   # WIKI_ROOT WIKI_NAME WIKI_REPO WIKI_REPO_PATH WIKI_STATE WIKI_REPOS
 ```
 
-If nothing resolves, the directory is not registered in `~/.claude/wikis.json`. Offer `init`, or ask which wiki is
-meant.
-
-No operation here has a review gate. Do the work, then report in a few lines what changed. Every operation ends
-with `index.md` and `log.md` up to date.
+Nothing resolves → the directory isn't in the registry (`~/.claude/wikis.json`, or `$WIKI_REGISTRY`): offer
+`init`. No op has a review gate; do the work and report what changed in a few lines.
 
 ## sync
 
-1. Run `<skill-dir>/bin/wiki-unsynced.sh` in the repo. It lists the commits, and prints `RANGE=` on
-   stderr. With no argument, sync the current repo. `sync all` goes through every repo in `WIKI_REPOS`.
-2. Read the range: `git log --stat <range>`, then `git show` the commits that matter. Skip lockfile, generated and
-   formatting-only diffs.
-3. Update the pages the change affects, and create any page a new component or concept needs. Record new decisions
-   as `decision` pages, and set `verified: <repo>@<sha>` on each code page you checked.
-4. In `state/<repo>.md`, rewrite **Now**, add a line to **Recent**, and set `synced.<branch>` to the short sha of
-   HEAD.
-5. Append `## [date] sync | <repo> <from>..<to>` to `log.md`, listing the pages you touched.
+Run it in the `wiki-sync` agent so it doesn't pay for this conversation's context:
 
-For a large first sync (dozens of commits), work in batches of about 10 commits and use the current source to
-check what is true now. The history only explains why.
+1. Write a brief of at most 10 lines: decisions, reasons and rejected options from this session that the commits
+   don't show (or "none").
+2. Spawn the plugin's `wiki-sync` agent (`llm-wiki:wiki-sync`) with the repo directory and that brief. `sync all`: one agent per
+   repo in `WIKI_REPOS`.
+3. Relay its summary (≤8 lines).
 
 ## ingest <source>
 
-1. Copy the source into `raw/`, keeping its name in kebab-case. Save a URL with WebFetch as `raw/<slug>.md`, with
-   the URL and date at the top. Nothing in `raw/` is edited after this.
-2. Tell the user in two or three lines what the source means for the project, and ask what to emphasise if
-   anything is unclear.
-3. Write `sources/<slug>.md` (type `source`), then update every page the source touches, noting any conflict with
-   existing claims. Finish with `index.md` and a `log.md` entry.
+1. Copy the source into `raw/` as kebab-case (a URL: WebFetch → `raw/<slug>.md` with URL and date on top).
+   `raw/` is never edited after this.
+2. Tell the user in 2–3 lines what it means for the project; ask what to emphasise if unclear.
+3. Find the pages it bears on with `wiki-find <terms>`; write `sources/<slug>.md` (type `source`) and update
+   those pages, flagging conflicts.
+4. `wiki-finish ingest --summary "…" --touched <pages>`.
 
 ## query <question>
 
-Read `index.md`, then the relevant pages (and the code, if the pages are stale or say too little). Answer with
-`[[wikilinks]]` as citations. If the answer is reusable (for example a thesis section, defense Q&A, or a
-comparison), offer to file it as a page and log it as `query`.
+`wiki-find <2-4 terms>` first; Read only the pages it points to (use its line numbers as offsets), plus code
+when a page is stale or thin. Answer with `[[wikilinks]]`. If the answer is reusable, offer to file it as a page
+and finish with `wiki-finish query --summary "…" --touched <page>`.
 
 ## save
 
-Update `state/<repo>.md` **Now / Next / Blocked** to reflect this session. Write down any decisions made
-(`decision` pages, or updates to existing pages). Move open questions into the state page or the relevant page.
-If the session was a real design discussion, also write `discussions/YYYY-MM-DD-<slug>.md` from the wiki's
-template. Append a `save` entry to `log.md`. `synced:` is left alone: only `sync` moves it.
+Rewrite **Now / Next / Blocked** in `state/<repo>.md` (short: Now ≤3 lines). Put decisions into `decision` pages,
+open questions into the state page or the relevant page; a real design discussion also gets
+`discussions/YYYY-MM-DD-<slug>.md`. Then `wiki-finish save --summary "…" --touched <pages>`. `synced:` moves only
+on sync.
 
 ## lint
 
-Run the mechanical checks with Bash/Grep:
-- wikilinks with no matching file
-- `.md` files not listed in `index.md`
-- orphan pages
-- `verified: repo@sha` pages whose cited paths changed after that sha (`git log --oneline <sha>..HEAD -- <paths>`)
-- open questions dated more than 14 days ago
-
-Then read for contradictions between pages. Fix the mechanical problems yourself. Report the judgement calls as a
-short list and log the result as `lint`.
+1. `wiki-lint "$WIKI_ROOT" $WIKI_REPOS` — broken links, pages missing from the index, orphans, stale `verified:`.
+   `--diet` adds the content-diet report (dated sections, oversized pages, big code blocks, missing `summary:`);
+   it only reports.
+2. Fix the mechanical findings (`wiki-index` rebuilds the index list). Read only the pages lint flags when
+   checking for contradictions, never the whole wiki.
+3. Report judgement calls as a short list; `wiki-finish lint --summary "…"`.
 
 ## init <wiki-dir>
 
-Create `CLAUDE.md` (the schema: purpose, folders, page types and project-specific rules; start from
-`<skill-dir>/templates/schema.md`), plus `index.md`, `log.md`, `raw/` and one `state/<repo>.md` per repo (from
-`<skill-dir>/templates/state.md`). Register the wiki in `~/.claude/wikis.json` (use `jq`, and merge rather than overwrite).
-Then offer a first `sync all`.
+1. Create the folder with `CLAUDE.md` (from `templates/schema.md`), `index.md`, `log.md`, `state/<repo>.md`
+   (from the templates here) and the folders the schema names.
+2. Register it in the registry: `{ "<wiki-dir>": { "name": "…", "repos": { "<repo>": "<abs path>" } } }` (create
+   the file if missing; keep every existing entry).
+3. `wiki-map` (code map), `wiki-index --init`, then write the first pages only for what the code can't tell:
+   decisions and why, traps, commands, external systems. No overview of what the code does — the code map covers
+   it. Finish with `wiki-finish init --summary "…"`.

@@ -1,0 +1,12 @@
+#!/usr/bin/env node
+// wiki-resolve [dir] — print eval-able KEY='value' lines for the wiki that claims dir (exit 1 if none).
+// Same output as v1 wiki-resolve.sh: WIKI_ROOT WIKI_NAME WIKI_REPO WIKI_REPO_PATH WIKI_STATE WIKI_REPOS.
+'use strict';
+const { resolve } = require('../lib/wiki');
+const r = resolve(process.argv[2] || process.cwd());
+if (!r) process.exit(1);
+const sh = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+const repos = Object.entries(r.repos).map(([k, v]) => `${k}=${v}`).join(' ');
+process.stdout.write([['WIKI_ROOT', r.root], ['WIKI_NAME', r.name], ['WIKI_REPO', r.repo],
+  ['WIKI_REPO_PATH', r.repoPath], ['WIKI_STATE', r.state], ['WIKI_REPOS', repos]]
+  .map(([k, v]) => `${k}=${sh(v)}`).join('\n') + '\n');
