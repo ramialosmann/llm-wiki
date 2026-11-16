@@ -8,7 +8,7 @@
     {
       "name": "llm-wiki",
       "source": "./",
-      "description": "A Claude-maintained markdown wiki per project, kept in step with git."
+      "description": "A token-lean, Claude-maintained markdown wiki per project, kept in step with git."
     }
   ],
   "metadata": {

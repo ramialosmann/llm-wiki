@@ -1,0 +1,82 @@
+#!/usr/bin/env node
+// wiki-sync-prep [repo-dir] [--max 40000] [--per-file 3000] — everything a sync needs, in one capped brief.
+//
+// Replaces `git log -p` over the range (often 100–600 KB). Prints: the unsynced commits, the wiki pages each
+// changed file maps to (via `paths:` globs, `repo:path` citations, or a page named like a path segment),
+// changed files no page covers, skipped noise, then the net diff of mapped files first, ≤ --per-file each,
+// stopping at --max. Fetch anything else with `git show <sha> -- <path>`.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { resolve, unsynced, git, listPages, frontmatter } = require('../lib/wiki');
+
+const argv = process.argv.slice(2);
+const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 ? argv.splice(i, 2)[1] : d; };
+const MAX = Number(opt('--max', 40000));
+const PER = Number(opt('--per-file', 3000));
+const r = resolve(argv[0] || process.cwd());
+if (!r || !r.repo) { console.error('wiki-sync-prep: not a tracked repo'); process.exit(2); }
+const u = unsynced(r, { limit: 500 });
+if (!u) { console.error('wiki-sync-prep: not a git repo'); process.exit(2); }
+if (!u.total) { console.log(`Nothing to sync: ${r.repo} is at ${u.base}.`); process.exit(0); }
+
+const NOISE = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb|[^/]*\.lock|__snapshots__\/.*|[^/]*\.snap|[^/]*\.min\.(js|css)|[^/]*\.map)$|(^|\/)(dist|build|\.next|coverage)\/|\.(png|jpe?g|gif|webp|ico|svg|pdf|woff2?|ttf|otf|mp4|zip)$/i;
+const globRe = (g) => new RegExp('^' + g.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*\/?/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]').replace(/\u0000/g, '.*') + '(/.*)?$');
+
+// First sync (nothing recorded): no base to diff against — list files touched by the range instead.
+const files = u.base
+  ? git(r.repoPath, ['diff', '--name-only', u.base, 'HEAD']).split('\n').filter(Boolean)
+  : [...new Set(git(r.repoPath, ['log', '--no-merges', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean))];
+const noise = files.filter((f) => NOISE.test(f));
+const real = files.filter((f) => !NOISE.test(f));
+
+// page -> matchers
+const pages = listPages(r.root).filter((p) => !/^(log|index|CLAUDE)\.md$/.test(p) && !/^(code|raw|state)\//.test(p)).map((p) => {
+  const text = fs.readFileSync(path.join(r.root, p), 'utf8');
+  const { data } = frontmatter(text);
+  const globs = [].concat(data.paths || []).filter(Boolean).map(String).map((g) => g.replace(new RegExp(`^${r.repo}:`), ''));
+  const cites = [...text.matchAll(new RegExp(`\\b${r.repo.replace(/[-]/g, '\\-')}:([\\w./\\[\\]()@-]+)`, 'g'))].map((m) => m[1].replace(/[.)]+$/, ''));
+  return { p, base: path.basename(p, '.md').toLowerCase(), globs: globs.map(globRe), cites };
+});
+const mapping = new Map(); // page -> files
+const uncovered = [];
+for (const f of real) {
+  const segs = f.toLowerCase().split('/');
+  segs.push(segs.pop().split('.')[0]); // orders.controller.ts -> orders
+  let hit = false;
+  for (const pg of pages) {
+    const m = pg.globs.some((re) => re.test(f)) || pg.cites.some((c) => f === c || f.startsWith(c.replace(/\/?$/, '/')))
+      || segs.includes(pg.base);
+    if (m) { (mapping.get(pg.p) || mapping.set(pg.p, []).get(pg.p)).push(f); hit = true; }
+  }
+  if (!hit) uncovered.push(f);
+}
+
+const out = [`# Sync brief — ${r.repo} ${u.range} (${u.total} commits, ${files.length} files)`, '', '## Commits', ...u.commits, ''];
+out.push('## Pages to check (page ← changed files)');
+const short = (fs_) => (fs_.length > 6 ? fs_.slice(0, 6).join(', ') + `, +${fs_.length - 6} more` : fs_.join(', '));
+for (const [p, fs_] of [...mapping].sort((a, b) => b[1].length - a[1].length)) out.push(`- ${p} ← ${short(fs_)}`);
+if (!mapping.size) out.push('- (no page maps to these files)');
+out.push('', `## Not covered by any page (${uncovered.length}) — new page, add \`paths:\` to an existing one, or skip`);
+out.push(...uncovered.slice(0, 40).map((f) => `- ${f}`), ...(uncovered.length > 40 ? [`- … +${uncovered.length - 40} more`] : []));
+if (noise.length) out.push('', `## Skipped noise (${noise.length}): ${short(noise)}`);
+
+if (!u.base) {
+  out.push('', '## Diffs', 'First sync: no recorded base, so no diff. Work from the current source in batches of ~10 commits (`git show <sha> --stat`).');
+} else {
+  out.push('', `## Diffs (net ${u.base}..HEAD, mapped files first, ≤${PER} chars each)`);
+  const mapped = new Set([...mapping.values()].flat());
+  const order = [...real.filter((f) => mapped.has(f)), ...real.filter((f) => !mapped.has(f))];
+  let used = out.join('\n').length, omitted = 0;
+  for (const f of order) {
+    let d = git(r.repoPath, ['diff', '-U2', u.base, 'HEAD', '--', f]).replace(/^diff --git[^\n]*\n(index [^\n]*\n)?/, '');
+    if (d.length > PER) d = d.slice(0, PER) + `\n… (clipped; full: git diff ${u.base} HEAD -- ${f})`;
+    const chunk = `### ${f}\n${d.trimEnd()}`;
+    if (used + chunk.length > MAX) { omitted++; continue; }
+    out.push(chunk);
+    used += chunk.length + 1;
+  }
+  if (omitted) out.push(`(${omitted} diffs omitted at the ${MAX}-char cap — git show <sha> -- <path> when needed)`);
+}
+out.push('', `Then: edit the pages, and finish with \`wiki-finish sync --summary "…" --touched <pages> --verified <pages checked against code> --bump\`.`);
+console.log(out.join('\n'));

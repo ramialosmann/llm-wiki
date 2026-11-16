@@ -1,9 +1,20 @@
 {
   "name": "llm-wiki",
-  "version": "1.0.0",
-  "description": "A Claude-maintained markdown wiki per project (Karpathy's LLM-wiki pattern), kept in step with git: sync, ingest, query, save, lint, init.",
-  "author": { "name": "Rami Al Osman", "url": "https://github.com/ramialosmann" },
+  "version": "2.0.0",
+  "description": "Token-lean, Claude-maintained markdown wiki per project (Karpathy's LLM-wiki pattern), kept in step with git: pointer-only session brief, subagent briefing, wiki-find lookup, zero-token code map, scripted sync bookkeeping, and tools to measure it.",
+  "author": {
+    "name": "Rami Al Osman",
+    "url": "https://github.com/ramialosmann"
+  },
   "repository": "https://github.com/ramialosmann/llm-wiki",
   "license": "MIT",
-  "keywords": ["wiki", "knowledge-base", "obsidian", "git", "documentation"]
+  "keywords": [
+    "wiki",
+    "knowledge-base",
+    "obsidian",
+    "git",
+    "documentation",
+    "tokens"
+  ],
+  "hooks": "./hooks/hooks.json"
 }

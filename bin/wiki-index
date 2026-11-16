@@ -1,0 +1,79 @@
+#!/usr/bin/env node
+// wiki-index [--init] [--backfill] [--dry-run] [--dir D] — regenerate index.md's page list from the pages.
+//
+// Only the block between <!-- wiki-index:start --> and <!-- wiki-index:end --> is rewritten; prose outside
+// it is kept. Summary per page: frontmatter `summary:` → the current index line → TL;DR line → title, so
+// switching an existing wiki over loses nothing.
+//   --init      add the markers (old body kept below them until you remove it)
+//   --backfill  copy each page's current index summary into its frontmatter `summary:`
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { resolve, frontmatter, listPages, indexEntries, linkResolver, setField, quote, writeAtomic } = require('../lib/wiki');
+
+const START = '<!-- wiki-index:start -->', END = '<!-- wiki-index:end -->';
+
+function summaries(root) {
+  const pages = listPages(root).filter((p) => !/^(index|log|CLAUDE)\.md$/.test(p));
+  const link = linkResolver(listPages(root));
+  const fromIndex = new Map(indexEntries(root).map((e) => [link(e.target), e.summary]));
+  return pages.map((p) => {
+    const { data, body } = frontmatter(fs.readFileSync(path.join(root, p), 'utf8'));
+    const tldr = (/^>\s*\[!abstract\][^\n]*\n>\s*(.+)$/m.exec(body) || [])[1];
+    return { p, summary: String(data.summary || fromIndex.get(p) || tldr || data.title || '').trim(),
+             own: data.summary, indexed: fromIndex.get(p) };
+  });
+}
+
+function block(root) {
+  const groups = new Map();
+  for (const s of summaries(root)) {
+    const g = s.p.includes('/') ? s.p.split('/')[0] : '';
+    // Bare basename links resolve in Obsidian (names are unique); state pages keep their folder for clarity.
+    const target = g === 'state' ? s.p.slice(0, -3) : path.basename(s.p, '.md');
+    (groups.get(g) || groups.set(g, []).get(g)).push(`- [[${target}]]${s.summary ? ' — ' + s.summary : ''}`);
+  }
+  const out = [START, ...(groups.get('') || [])];
+  for (const [g, lines] of [...groups].filter(([k]) => k).sort(([a], [b]) => a.localeCompare(b))) out.push('', `## ${g}`, ...lines);
+  return [...out, END].join('\n');
+}
+
+function rebuild(root, { init = false } = {}) {
+  const file = path.join(root, 'index.md');
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch { text = '---\ntitle: "Index"\ntype: index\n---\n'; }
+  const fresh = block(root);
+  if (text.includes(START) && text.includes(END)) {
+    return text.slice(0, text.indexOf(START)) + fresh + text.slice(text.indexOf(END) + END.length);
+  }
+  if (!init) return null;
+  const { body } = frontmatter(text);
+  const head = text.slice(0, text.length - body.length);
+  return `${head}\n${fresh}\n` + (body.trim() ? `\n## Previous index (check the list above, then delete this section)\n\n${body.trim()}\n` : '');
+}
+
+module.exports = { rebuild, summaries, START, END };
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const flag = (f) => args.includes(f);
+  const di = args.indexOf('--dir');
+  const r = resolve(di >= 0 ? args[di + 1] : process.cwd());
+  if (!r) { console.error('wiki-index: no wiki here'); process.exit(2); }
+  if (flag('--backfill')) {
+    let n = 0;
+    for (const s of summaries(r.root)) {
+      if (s.own || !s.indexed) continue;
+      n++;
+      if (flag('--dry-run')) { console.log(`summary → ${s.p}: ${s.indexed}`); continue; }
+      const file = path.join(r.root, s.p);
+      writeAtomic(file, setField(fs.readFileSync(file, 'utf8'), 'summary', quote(s.indexed)));
+    }
+    console.log(`wiki-index: ${flag('--dry-run') ? 'would backfill' : 'backfilled'} summary on ${n} pages`);
+    process.exit(0);
+  }
+  const next = rebuild(r.root, { init: flag('--init') });
+  if (next === null) { console.error('wiki-index: index.md has no wiki-index markers; run `wiki-index --init` once'); process.exit(1); }
+  if (flag('--dry-run')) process.stdout.write(next);
+  else { writeAtomic(path.join(r.root, 'index.md'), next); console.log(`wiki-index: ${path.join(r.root, 'index.md')}`); }
+}

@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+// wiki-find <terms…> [--budget N] [--pages|--code] [--dir D] — cheapest first look before grep/cat.
+//
+// Ranks wiki pages and code-map lines by the terms and prints, inside a token budget (chars/4):
+// each hit page's path, summary and best line (with line number), then matching code-map lines
+// (route/screen/job/export → path:line). Read only the pages/files it points to.
+// Matching is case-insensitive and ignores - _ and spaces, so "order total" finds orderTotal.
+// Exit: 0 hits, 1 no hits, 2 no wiki for this directory.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+const { resolveAny, frontmatter, listPages, indexEntries, linkResolver, codeMapPath } = require('../lib/wiki');
+
+const args = process.argv.slice(2);
+const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args.splice(i, 2)[1] : def; };
+const budget = Number(opt('--budget', 1200)) || 1200;
+const dir = opt('--dir', process.cwd());
+const only = args.includes('--pages') ? 'pages' : args.includes('--code') ? 'code' : '';
+const terms = args.filter((a) => !a.startsWith('--')).map((t) => t.toLowerCase()).filter(Boolean);
+if (!terms.length) { console.error('usage: wiki-find <terms…> [--budget 1200] [--pages|--code]'); process.exit(2); }
+
+const r = resolveAny(dir);
+if (!r) { console.error('wiki-find: no wiki registered for this directory'); process.exit(2); }
+
+const squash = (s) => s.toLowerCase().replace(/[-_\s]/g, '');
+const tq = terms.map(squash);
+const has = (line, i) => { const l = line.toLowerCase(); return l.includes(terms[i]) || squash(line).includes(tq[i]); };
+const matched = (line) => terms.reduce((n, _, i) => n + (has(line, i) ? 1 : 0), 0);
+
+// Pages: score = Σ min(lines hit, 3) + 5 per distinct term + 3 per term in path/title/summary.
+const pages = [];
+if (only !== 'code') {
+  const all = listPages(r.root);
+  const link = linkResolver(all);
+  const indexSummary = new Map(indexEntries(r.root).map((e) => [link(e.target), e.summary]));
+  for (const rel of all) {
+    if (/^(log|index)\.md$/.test(rel) || rel.startsWith('code/')) continue;
+    let text;
+    try { text = fs.readFileSync(path.join(r.root, rel), 'utf8'); } catch { continue; }
+    const { data, body } = frontmatter(text);
+    const offset = text.slice(0, text.length - body.length).split('\n').length - 1;
+    const tldr = (/^>\s*\[!abstract\][^\n]*\n>\s*(.+)$/m.exec(body) || [])[1];
+    const summary = String(data.summary || indexSummary.get(rel) || tldr || data.title || '').trim();
+    const head = `${rel} ${data.title || ''} ${summary}`;
+    const lines = body.split('\n');
+    let score = 0, best = null;
+    terms.forEach((_, i) => {
+      const hits = lines.filter((l) => has(l, i)).length;
+      if (hits) score += Math.min(hits, 3) + 5;
+      if (has(head, i)) score += 3 + (hits ? 0 : 5);
+    });
+    if (!score) continue;
+    lines.forEach((l, n) => {
+      const m = matched(l);
+      if (m && l.trim() && (!best || m > best.m)) best = { m, n: n + 1 + offset, l: l.trim() };
+    });
+    pages.push({ rel, score, summary, best, verified: data.verified || '' });
+  }
+  pages.sort((a, b) => b.score - a.score || a.rel.localeCompare(b.rel));
+}
+
+// Code maps: this repo's first (rebuilt if stale, 3s cap), then the wiki's other repos.
+const code = [];
+let mapNote = '';
+if (only !== 'pages') {
+  if (r.repo) {
+    const res = spawnSync(process.execPath, [path.join(__dirname, 'wiki-map'), r.repoPath, '--if-stale', '--quiet'],
+                          { timeout: 3000, stdio: 'ignore' });
+    if (res.error || res.status !== 0) mapNote = ' (map may be stale)';
+  }
+  const repos = [r.repo, ...Object.keys(r.repos).filter((k) => k !== r.repo)].filter(Boolean);
+  for (const repo of repos) {
+    let text;
+    try { text = fs.readFileSync(codeMapPath(r, repo), 'utf8'); } catch { continue; }
+    const { data, body } = frontmatter(text);
+    for (const raw of body.split('\n')) {
+      const l = raw.replace(/^- /, '');
+      if (!l.trim() || l.startsWith('#') || l.startsWith('>')) continue;
+      const m = matched(l);
+      if (m) code.push({ m, l: l.length > 220 ? l.slice(0, 217) + '…' : l, own: repo === r.repo, repo,
+                         sha: String(data.built_at || '').slice(0, 8) });
+    }
+  }
+  code.sort((a, b) => b.m - a.m || b.own - a.own || a.l.length - b.l.length);
+}
+
+if (!pages.length && !code.length) { console.log(`wiki-find: no hits for ${terms.join(' ')} — fall back to grep`); process.exit(1); }
+
+// Budget: 60% pages / 40% code, unused share flows to the other side.
+const total = budget * 4;
+const pageText = pages.map((p) => [`${p.rel} — ${p.summary.slice(0, 160)}${p.verified ? ` [verified ${p.verified}]` : ''}`,
+  ...(p.best ? [`  L${p.best.n}: ${p.best.l.slice(0, 200)}`] : [])].join('\n'));
+const codeText = code.map((c) => c.l + (c.own ? '' : `  [${c.repo}]`));
+const fit = (items, cap) => { const out = []; let used = 0; for (const t of items) { if (used + t.length + 1 > cap) break; out.push(t); used += t.length + 1; } return { out, used }; };
+const codeNeed = codeText.join('\n').length + 1;
+const p = fit(pageText, only === 'code' ? 0 : only === 'pages' ? total : Math.max(total * 0.6, total - codeNeed));
+const c = fit(codeText, total - p.used);
+
+const out = [];
+if (p.out.length) out.push('## Pages', ...p.out);
+if (c.out.length) {
+  const own = code.find((x) => x.own);
+  out.push(`## Code map${own ? ` (${r.repo}@${own.sha}${mapNote})` : ''}`, ...c.out);
+}
+const cut = [pages.length - p.out.length, code.length - c.out.length];
+if (cut[0] || cut[1]) out.push(`[trimmed: ${cut[0]} pages, ${cut[1]} code lines — narrow the terms or --budget ${budget * 2}]`);
+console.log(out.join('\n'));

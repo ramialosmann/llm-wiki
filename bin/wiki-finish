@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+// wiki-finish <op> --summary "…" [--title "…"] [--touched a,b] [--verified a,b] [--bump] [--dry-run] [--dir D]
+//
+// The mechanical end of every wiki op, so Claude never reads log.md or hand-edits bookkeeping:
+//   --bump      set state/<repo>.md synced.<branch> to HEAD (sync only)
+//   --touched   set `updated: <today>` on these pages (paths or basenames)
+//   --verified  set `verified: <repo>@<HEAD>` on these pages
+//   then append `## [date] <op> | <title>` to log.md (append-only, never read) and refresh index.md's block.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { resolve, git, unsynced, listPages, linkResolver, setField, setSynced, today, writeAtomic } = require('../lib/wiki');
+const { rebuild } = require('./wiki-index');
+
+const OPS = ['sync', 'ingest', 'query', 'save', 'decision', 'lint', 'init'];
+const argv = process.argv.slice(2);
+const opt = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
+const list = (n) => (opt(n) || '').split(',').map((s) => s.trim()).filter(Boolean);
+const op = argv[0];
+const dry = argv.includes('--dry-run');
+if (!OPS.includes(op) || !opt('--summary')) {
+  console.error(`usage: wiki-finish <${OPS.join('|')}> --summary "…" [--title "…"] [--touched a,b] [--verified a,b] [--bump] [--dry-run]`);
+  process.exit(2);
+}
+const r = resolve(opt('--dir') || process.cwd());
+if (!r) { console.error('wiki-finish: no wiki here'); process.exit(2); }
+
+const date = today();
+const head = r.repo ? git(r.repoPath, ['rev-parse', '--short', 'HEAD']).trim() : '';
+const link = linkResolver(listPages(r.root));
+const writes = new Map(); // abs path -> new text
+const edit = (abs, fn) => writes.set(abs, fn(writes.get(abs) ?? fs.readFileSync(abs, 'utf8')));
+const pageOf = (name) => { const p = link(name); if (!p) throw new Error(`no page matches "${name}"`); return path.join(r.root, p); };
+
+let range = '';
+try {
+  if (argv.includes('--bump')) {
+    if (!r.repo || !head) throw new Error('--bump needs a tracked repo');
+    const u = unsynced(r, { limit: 1 });
+    range = `${u && u.base ? u.base : '(start)'}..${head}`;
+    if (!fs.existsSync(r.state)) throw new Error(`no state page at ${r.state}`);
+    edit(r.state, (t) => setField(setSynced(t, u.branch, head), 'updated', date));
+  }
+  for (const p of list('--touched')) edit(pageOf(p), (t) => setField(t, 'updated', date));
+  for (const p of list('--verified')) {
+    if (!r.repo || !head) throw new Error('--verified needs a tracked repo');
+    edit(pageOf(p), (t) => setField(setField(t, 'verified', `${r.repo}@${head}`), 'updated', date));
+  }
+} catch (e) { console.error('wiki-finish: ' + e.message); process.exit(1); }
+
+const touched = [...new Set([...list('--touched'), ...list('--verified')].map((p) => path.basename(link(p), '.md')))];
+const title = opt('--title') || (op === 'sync' && r.repo ? `${r.repo} ${range}` : opt('--summary').slice(0, 60));
+const entry = [`## [${date}] ${op} | ${title}`, ...opt('--summary').split(/\n|(?<=\.)\s+(?=[A-Z])/).filter(Boolean).map((s) => `- ${s.trim()}`),
+  ...(touched.length ? [`- Touched: ${touched.map((t) => `[[${t}]]`).join(', ')}`] : [])].join('\n');
+
+const logFile = path.join(r.root, 'log.md');
+let sep = '\n\n';
+try { // look at the last byte only — log.md is never read whole
+  const fd = fs.openSync(logFile, 'r');
+  const size = fs.fstatSync(fd).size;
+  const b = Buffer.alloc(1);
+  if (size) fs.readSync(fd, b, 0, 1, size - 1);
+  fs.closeSync(fd);
+  sep = !size ? '' : b.toString() === '\n' ? '\n' : '\n\n';
+} catch { /* new log */ }
+
+if (dry) {
+  for (const f of writes.keys()) console.log(`would update ${path.relative(r.root, f)}`);
+  console.log(`would append to log.md:\n${entry}`);
+  process.exit(0);
+}
+for (const [f, t] of writes) writeAtomic(f, t);
+fs.appendFileSync(logFile, sep + entry + '\n');
+const idx = rebuild(r.root);
+if (idx !== null) writeAtomic(path.join(r.root, 'index.md'), idx);
+console.log(`wiki-finish: ${writes.size} page(s) updated, log.md appended${idx === null ? ' (index.md has no markers: run wiki-index --init)' : ', index.md refreshed'}`);
